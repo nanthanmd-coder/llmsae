@@ -1,0 +1,29 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# PyTorch
+torch==2.3.0
+torchvision
+
+# Core ML
+transformers==4.45.0
+peft==0.12.0
+accelerate==0.34.0
+huggingface_hub==0.36.2
+tokenizers>=0.20
+safetensors==0.5.3
+
+# Data / utilities / viz
+omegaconf
+numpy==1.24.4
+pandas==2.0.3
+pyarrow==17.0.0
+pillow==10.4.0
+scikit-learn==1.3.2
+scipy==1.10.1
+matplotlib==3.7.5
+einops==0.8.1
+tqdm==4.67.3
+tensorboard
+
+# For HF downloads
+hf_transfer
