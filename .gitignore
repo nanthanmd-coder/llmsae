@@ -10,6 +10,7 @@ sae_trainer/finetune_models/*
 demo/llava1.5/*
 !demo/llava1.5/README.md
 
+MMEB-eval/
 # 训练输出整个目录都不要
 llm_trainer/outputs/
 
