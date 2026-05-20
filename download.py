@@ -124,6 +124,41 @@ def extract_zip(local_dir, zip_name, extract_to_name, delete_zip=False):
         zip_path.unlink()
         print(f"  → removed {zip_path}")
 
+def auto_detect_endpoint(timeout: float = 4.0) -> str | None:
+    """
+    Probe both HF endpoints via TCP handshake; return the faster reachable one.
+    Returns None if neither is reachable.
+    """
+    import socket
+    import time
+
+    candidates = [
+        ("https://huggingface.co", "huggingface.co"),
+        ("https://hf-mirror.com", "hf-mirror.com"),
+    ]
+
+    print(">>> Auto-detecting fastest endpoint...")
+    results = []
+    for url, host in candidates:
+        try:
+            start = time.time()
+            with socket.create_connection((host, 443), timeout=timeout):
+                pass
+            elapsed_ms = (time.time() - start) * 1000
+            results.append((elapsed_ms, url, host))
+            print(f"    ✓ {host}: {elapsed_ms:.0f} ms")
+        except (socket.timeout, socket.gaierror, OSError) as e:
+            print(f"    ✗ {host}: {type(e).__name__} ({e})")
+
+    if not results:
+        print("    ⚠ Neither endpoint reachable. Check your network/VPN.")
+        return None
+
+    results.sort()
+    fastest_url = results[0][1]
+    fastest_host = results[0][2]
+    print(f"    → Selected: {fastest_host}")
+    return fastest_url
 
 def main():
     parser = argparse.ArgumentParser(
@@ -133,8 +168,15 @@ def main():
     keys = [m["key"] for m in ITEMS]
     parser.add_argument("--only", choices=keys, default=None,
                         help="Only process one of: " + ", ".join(keys))
-    parser.add_argument("--mirror", action="store_true",
-                        help="Use https://hf-mirror.com (recommended in China)")
+
+    endpoint_group = parser.add_mutually_exclusive_group()
+    endpoint_group.add_argument("--mirror", action="store_true",
+                                help="Force using https://hf-mirror.com")
+    endpoint_group.add_argument("--no-mirror", action="store_true",
+                                help="Force using https://huggingface.co (skip auto-detect)")
+    endpoint_group.add_argument("--endpoint", default=None,
+                                help="Use a custom HF endpoint URL")
+
     parser.add_argument("--token", default=os.environ.get("HF_TOKEN"),
                         help="Hugging Face access token (or set HF_TOKEN env)")
     parser.add_argument("--delete-zip", action="store_true",
@@ -143,16 +185,27 @@ def main():
                         help="Download only, don't extract any zips")
     args = parser.parse_args()
 
-    # Anchor all paths to where this script lives
     script_dir = Path(__file__).resolve().parent
     os.chdir(script_dir)
     print(f">>> Working directory: {script_dir}")
 
-    if args.mirror:
-        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        print(">>> Using mirror: https://hf-mirror.com")
+    # Decide endpoint
+    if args.endpoint:
+        chosen_endpoint = args.endpoint
+        print(f">>> Custom endpoint: {chosen_endpoint}")
+    elif args.mirror:
+        chosen_endpoint = "https://hf-mirror.com"
+        print(f">>> Forced mirror: {chosen_endpoint}")
+    elif args.no_mirror:
+        chosen_endpoint = "https://huggingface.co"
+        print(f">>> Forced direct: {chosen_endpoint}")
     else:
-        print(f">>> HF endpoint: {os.environ.get('HF_ENDPOINT', 'https://huggingface.co')}")
+        chosen_endpoint = auto_detect_endpoint()
+        if chosen_endpoint is None:
+            print(">>> Falling back to https://hf-mirror.com (default)")
+            chosen_endpoint = "https://hf-mirror.com"
+
+    os.environ["HF_ENDPOINT"] = chosen_endpoint
 
     if args.token:
         print(">>> Using HF token")
