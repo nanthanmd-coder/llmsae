@@ -1,0 +1,79 @@
+# ==== 实验标识 ====
+exp_name: default
+output_dir: outputs/${exp_name}
+seed: 42
+
+# ==== 模型 ====
+model:
+  base_path: ../pretrained_models/llama3-llava-next-8b-hf
+  torch_dtype: bfloat16
+  device_map: auto
+  lora:
+    enable: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# ==== SAE 挂载 ====
+sae:
+  enable: true
+  module_path: ../sae_trainer/sae_model.py
+  class_name: null
+  ckpt_path: ../sae_trainer/finetune_models/llama3-llava-next-8b-hf-sae-131k/model.layers.24
+  init_kwargs: {}
+  layer_idx: 24
+  hook_point: residual
+  replace_hidden: false
+  trainable: false
+  lambda_sparsity: 0.0
+  lambda_align: 0.0
+
+# ==== 数据 (MMEB 风格) ====
+data:
+  # MMEB 数据根目录,下面每个子目录是一个数据集 (含 *.parquet)
+  data_root: ../../MMEB-eval
+  images_root: ../../MMEB-eval/images
+  # 训练 / 评估各用哪些数据集 (子目录名)。null 表示全用
+  train_datasets: null
+  eval_datasets: null
+  # 每条样本最多保留多少个候选 (避免长尾样本拖慢训练)
+  # 注意: LLaVA-Next 单图 ~2880 个 image tokens, max_candidates 不能太大
+  max_candidates: 12
+  # parquet 里若有指示真值列下标的列名,填这里;没有就保持 null (默认真值在第 0 个)
+  gold_idx_col: null
+  # 单条 (query 或 candidate) 的文本最大 token 数 (仅对无图样本生效, 有图样本不截断)
+  # 有图样本会被 processor 自动扩展到 ~3000 tokens, 不受此值限制
+  max_length: 3500
+  num_workers: 4
+
+# ==== 训练 ====
+train:
+  epochs: 2
+  # MMEB 样本数;实际展平后 batch 内条数 = batch_size * (1 + K_avg)
+  batch_size: 4
+  grad_accum_steps: 16
+  lr: 1.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+
+  # 检索任务参数
+  pool_layer_idx: 24             # 在哪一层池化得 embedding;默认与 sae.layer_idx 一致
+  info_nce_temp: 0.07
+
+  save_steps: 500
+  eval_steps: 500
+  log_steps: 5             # 每 N 个 optimizer step 打一次详细日志
+  iter_log_steps: 4        # 每 N 个 micro-batch (iter) 打一次简短状态;避免长时间静默
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+
+# ==== 评估 ====
+eval:
+  batch_size: 1
+  max_new_tokens: 0
+  metrics: ["top1_acc"]

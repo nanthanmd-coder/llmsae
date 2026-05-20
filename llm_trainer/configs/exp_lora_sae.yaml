@@ -1,0 +1,29 @@
+defaults:
+  - base
+
+exp_name: exp_mmeb_lora_sae
+
+sae:
+  enable: true
+  layer_idx: 24
+  trainable: false
+  init_kwargs: {}
+  lambda_sparsity: 1.0e-3
+  lambda_align: 0.0
+
+data:
+  data_root: ../../MMEB-eval
+  images_root: ../../MMEB-eval/images
+  # 示例: 只用这两个数据集训练; 改成 null 用全部
+  train_datasets: ["ChartQA", "MSCOCO"]
+  eval_datasets: ["ChartQA"]
+  max_candidates: 16
+  max_length: 512
+
+train:
+  epochs: 2
+  batch_size: 1
+  grad_accum_steps: 16
+  lr: 1.0e-4
+  pool_layer_idx: 24
+  info_nce_temp: 0.07

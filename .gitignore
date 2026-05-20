@@ -1,0 +1,42 @@
+# ===== 之前的内容保留 =====
+pretrained_models/*
+!pretrained_models/README.md
+
+sae_trainer/finetune_models/*
+!sae_trainer/finetune_models/README.md
+
+# ===== 新增 =====
+# Demo 权重 (保留目录,排除内容)
+demo/llava1.5/*
+!demo/llava1.5/README.md
+
+# 训练输出整个目录都不要
+llm_trainer/outputs/
+
+# 通用的训练输出/checkpoint 兜底,以防其他地方也有
+**/checkpoints/
+**/runs/
+**/wandb/
+**/logs/
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+*.bin
+
+# Python 常规
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+
+# 系统/IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# 凭据
+.env
+*.key
+*.pem
