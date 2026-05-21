@@ -1,26 +1,31 @@
 """
 eval_zero_shot.py
 -----------------
-零样本 baseline 评估。
+零样本 baseline 评估 (GPU 全程版)。
 
 每个 query 的 candidate 池来自该 query 自己的 tgt 列表 (tgt[0]=真值, tgt[1:]=负样本)。
 不同 query 的 tgt 经常重复, 所以 unique candidate 只 forward 一次, 用 cid 索引复用。
 
-抽样模拟全局: 抽 20% candidate (保留真值) 算 rank, rank × (1/sample_ratio) 还原全局 rank。
-报告: top-1 / top-5 / MRR (按近似还原后的 rank 算)。
-
+抽样模拟全局: 抽 sample_ratio 的 candidate (保留真值) 算 rank, rank/ratio 还原全局 rank。
 三路对比: orig (原始 hidden) / sae (SAE 稀疏) / avg (两路相似度平均)
+
+性能要点 (全 GPU):
+  - emb / SAE 激活 留在 GPU, 不搬 CPU
+  - cos_sim / sparse_sim 全在 GPU 上算
+  - SAE 用 build_sparse_lookup 整个 candidate 池一次性稠密化到 GPU [N, V]
+  - DataLoader num_workers 多线程加载图片
 
 用法:
   python eval_zero_shot.py --config configs/exp_lora_sae.yaml \
-                           --datasets A-OKVQA ChartQA \
-                           --num_queries 200 --sample_ratio 0.2
+                           --datasets A-OKVQA --num_queries 200 --sample_ratio 0.2
 """
 import os
 import json
 import time
 import random
 import argparse
+import threading
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -35,6 +40,47 @@ from data import (
     _is_nonempty_str, _normalize_to_list,
     _resolve_image_path, _find_parquet_files
 )
+
+
+# ============================================================
+# GPU 监控线程
+# ============================================================
+class GPUMonitor:
+    def __init__(self, interval=300):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self._thread = None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output([
+                    "nvidia-smi",
+                    "--query-gpu=index,utilization.gpu,memory.used,memory.total,"
+                    "temperature.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ], timeout=3).decode().strip()
+                for line in out.splitlines():
+                    idx, util, mu, mt, temp, pw = [x.strip() for x in line.split(",")]
+                    print(f"  [gpu{idx}] util={util}%  mem={mu}/{mt}MiB  "
+                          f"temp={temp}C  power={pw}W", flush=True)
+            except Exception as e:
+                print(f"  [gpu monitor error] {e}", flush=True)
+            if self._stop.wait(self.interval):
+                break
 
 
 def load_config(path):
@@ -56,20 +102,13 @@ def load_config(path):
 # ============================================================
 def collect_units(data_root, dataset_name, images_root=None,
                   num_query_sample=None, seed=42):
-    """
-    返回:
-      queries:        list[{qid, text, image_path}]
-      cands:          list[{cid, text, image_path}]    所有 query 的 tgt 合并去重
-      qid2cand_cids:  {qid: [cid, ...]}                 每个 query 自己的候选 cid 列表
-      qid2gold_pos:   {qid: int}                        gold 在 qid2cand_cids[qid] 里的下标(总是 0)
-    """
     ds_dir = os.path.join(data_root, dataset_name)
     files = _find_parquet_files(ds_dir)
     if not files:
         raise FileNotFoundError(f"no parquet in {ds_dir}")
     df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
-    cand_dict = {}   # (text, image_path) -> cid
+    cand_dict = {}
     def _intern(text, image_path):
         key = (text, image_path)
         if key not in cand_dict:
@@ -85,8 +124,7 @@ def collect_units(data_root, dataset_name, images_root=None,
         q_text = row["qry_text"] if _is_nonempty_str(row["qry_text"]) else ""
         q_img = row["qry_img_path"] if _is_nonempty_str(row["qry_img_path"]) else ""
         queries.append({
-            "qid": qid,
-            "text": q_text,
+            "qid": qid, "text": q_text,
             "image_path": _resolve_image_path(q_img, data_root, images_root),
         })
 
@@ -101,7 +139,7 @@ def collect_units(data_root, dataset_name, images_root=None,
                 continue
             cand_cids.append(_intern(t, i))
         qid2cand_cids[qid] = cand_cids
-        qid2gold_pos[qid] = 0   # tgt[0] = gold
+        qid2gold_pos[qid] = 0
 
     cands = [
         {"cid": cid, "text": t,
@@ -117,7 +155,7 @@ def collect_units(data_root, dataset_name, images_root=None,
 
 
 # ============================================================
-# Embedding 提取 (统一 forward 一遍 unique units)
+# Dataset / collate
 # ============================================================
 class UnitDataset(Dataset):
     def __init__(self, units):
@@ -130,11 +168,8 @@ class UnitDataset(Dataset):
         if u["image_path"]:
             try:
                 img = Image.open(u["image_path"]).convert("RGB")
-                # 合理性检查: 太小或奇怪比例的图跳过
-                # LLaVA-Next 处理时要求至少几十像素
                 w, h = img.size
                 if w < 16 or h < 16 or w > 8192 or h > 8192:
-                    # 太小或太大都跳过, 算无图样本
                     image = None
                 else:
                     image = img
@@ -170,13 +205,11 @@ def build_collate(processor, max_length=512):
                 r_with = processor(text=txt_img, images=imgs,
                                    padding=True, truncation=False, return_tensors="pt")
             except Exception as e:
-                # 兜底: 万一某张图能打开但 processor 处理崩溃, 把整批退化为纯文本
-                print(f"[collate] processor failed on images, fallback to text-only: {e}",
+                print(f"[collate] processor failed on images, fallback text-only: {e}",
                       flush=True)
                 r_with = processor.tokenizer(
-                    txt_img,
-                    padding="max_length", truncation=True, max_length=max_length,
-                    return_tensors="pt")
+                    txt_img, padding="max_length", truncation=True,
+                    max_length=max_length, return_tensors="pt")
 
         def _L(r): return r["input_ids"].shape[1] if r is not None else 0
         L = max(_L(r_no), _L(r_with))
@@ -209,6 +242,9 @@ def build_collate(processor, max_length=512):
     return collate
 
 
+# ============================================================
+# Extractor: emb 留 GPU, SAE 激活留 GPU
+# ============================================================
 class Extractor:
     def __init__(self, model, sae_hook, pool_layer_idx, device):
         self.model = model
@@ -233,23 +269,34 @@ class Extractor:
         self._handle = layers[pool_layer_idx].register_forward_hook(_hk)
 
     @torch.no_grad()
-    def encode(self, ds, batch_size, collate, desc=""):
+    def encode(self, ds, batch_size, collate, desc="", num_workers=4,
+               keep_emb_on_gpu=True):
+        """
+        返回:
+          ids:   list[str]
+          origs: [N, D] tensor (GPU if keep_emb_on_gpu)
+          saes:  list[(acts_gpu, inds_gpu)]  每个样本的稀疏激活, 留 GPU
+        """
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            num_workers=0, collate_fn=collate)
+                            num_workers=num_workers, collate_fn=collate,
+                            pin_memory=True,
+                            persistent_workers=(num_workers > 0))
         ids, origs, saes = [], [], []
         n = len(loader)
         t0 = time.time()
         self.model.eval()
         for i, batch in enumerate(loader):
             bids = batch.pop("ids")
-            batch = {k: v.to(self.device) for k, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
+            batch = {k: v.to(self.device, non_blocking=True)
+                     for k, v in batch.items() if isinstance(v, torch.Tensor)}
             self._cache.clear()
             _ = self.model(**batch, use_cache=False)
-            h = self._cache["h"]
+            h = self._cache["h"]                       # GPU
             am = batch["attention_mask"].to(h.dtype)
             emb = ((h * am.unsqueeze(-1)).sum(1) /
-                   am.sum(1, keepdim=True).clamp_min(1e-6)).float().cpu()
+                   am.sum(1, keepdim=True).clamp_min(1e-6)).float()  # GPU
+            if not keep_emb_on_gpu:
+                emb = emb.cpu()
             origs.append(emb)
 
             if self.sae_hook is not None and self.sae_hook.cache:
@@ -259,16 +306,18 @@ class Extractor:
                     mask = am.unsqueeze(-1).to(ta.dtype)
                     ta_m = ta * mask / am.sum(1, keepdim=True).unsqueeze(-1).clamp_min(1.0)
                     B, L, K = ta.shape
-                    pa = ta_m.reshape(B, L * K).cpu()
-                    pi = ti.reshape(B, L * K).cpu()
+                    pa = ta_m.reshape(B, L * K)        # GPU
+                    pi = ti.reshape(B, L * K)          # GPU
                     for b in range(B):
-                        saes.append((pa[b], pi[b]))
+                        # 留在 GPU
+                        saes.append((pa[b].clone(), pi[b].clone()))
 
             ids.extend(bids)
             if (i + 1) % max(n // 10, 1) == 0 or i == n - 1:
                 print(f"  [{desc}] {i+1}/{n} ({100*(i+1)/n:.0f}%) "
                       f"elapsed={time.time()-t0:.0f}s", flush=True)
-        return ids, torch.cat(origs, dim=0), saes
+        origs = torch.cat(origs, dim=0)
+        return ids, origs, saes
 
     def close(self):
         if self._handle is not None:
@@ -276,61 +325,102 @@ class Extractor:
 
 
 # ============================================================
-# 相似度: 给定 q_emb 和 c_emb (子集), 算余弦; 稀疏的同理
+# 相似度 (全 GPU)
 # ============================================================
 def cos_sim(q, c):
-    """q:[D], c:[N,D]  -> [N]"""
+    """q:[D], c:[N,D] -> [N]  (在 q/c 所在 device 上算)"""
     q = F.normalize(q.float().unsqueeze(0), dim=-1).squeeze(0)
     c = F.normalize(c.float(), dim=-1)
     return c @ q
 
 
-def sparse_sim(q_sparse, c_sparse_list):
+def build_sparse_lookup(sparse_list, device="cuda", chunk_size=128, verbose=True):
     """
-    q_sparse: (acts[L*K], inds[L*K])
-    c_sparse_list: list of (acts, inds), 长度 N
-    返回 [N] 余弦相似度
+    整个 candidate 池一次性稠密化到 GPU [N, V] (处理不等长样本):
+      1. 求所有 indices 并集 V
+      2. 分块批量 scatter
+      3. L2 归一化
+    返回: (dense_norm[N,V] GPU, idx_to_pos GPU, unique GPU)
     """
-    # 收集本 q 涉及的所有 indices, 在它们的并集上稠密化
-    all_inds = [q_sparse[1]] + [c[1] for c in c_sparse_list]
-    cat = torch.cat(all_inds)
-    unique = torch.unique(cat)
+    if len(sparse_list) == 0:
+        return None
+
+    N = len(sparse_list)
+
+    # 求并集 (在 GPU 上 cat + unique; sparse_list 已在 GPU)
+    t = time.time()
+    all_inds = torch.cat([s[1] for s in sparse_list])
+    unique = torch.unique(all_inds)
     V = unique.shape[0]
     max_idx = int(unique.max().item())
-    idx_to_pos = torch.full((max_idx + 1,), -1, dtype=torch.long)
-    idx_to_pos[unique] = torch.arange(V)
+    del all_inds
+    if verbose:
+        print(f"    union V={V}, max_idx={max_idx}, took {time.time()-t:.1f}s",
+              flush=True)
 
-    def _to_dense(acts, inds):
-        d = torch.zeros(V, dtype=torch.float32)
-        d.scatter_add_(0, idx_to_pos[inds], acts.float())
-        return d
+    idx_to_pos = torch.full((max_idx + 1,), -1, dtype=torch.long, device=device)
+    idx_to_pos[unique] = torch.arange(V, device=device)
 
-    q_d = F.normalize(_to_dense(*q_sparse).unsqueeze(0), dim=-1).squeeze(0)
-    N = len(c_sparse_list)
-    sims = torch.zeros(N, dtype=torch.float32)
-    for j, c in enumerate(c_sparse_list):
-        c_d = _to_dense(*c)
-        c_d = c_d / (c_d.norm() + 1e-8)
-        sims[j] = c_d @ q_d
+    mem_gb = N * V * 4 / 1e9
+    if verbose:
+        print(f"    allocating dense [N={N}, V={V}] fp32 = {mem_gb:.1f} GB", flush=True)
+    dense = torch.zeros(N, V, dtype=torch.float32, device=device)
+
+    t = time.time()
+    for s in range(0, N, chunk_size):
+        e = min(s + chunk_size, N)
+        max_len = max(sparse_list[i][0].shape[0] for i in range(s, e))
+        chunk = e - s
+        acts_chunk = torch.zeros(chunk, max_len, dtype=torch.float32, device=device)
+        inds_chunk = torch.full((chunk, max_len), int(unique[0].item()),
+                                dtype=torch.long, device=device)
+        for k, i in enumerate(range(s, e)):
+            L_i = sparse_list[i][0].shape[0]
+            acts_chunk[k, :L_i] = sparse_list[i][0].float()
+            inds_chunk[k, :L_i] = sparse_list[i][1].long()
+        pos_chunk = idx_to_pos[inds_chunk]
+        dense[s:e].scatter_add_(1, pos_chunk, acts_chunk)
+        del acts_chunk, inds_chunk, pos_chunk
+        if verbose and (s // chunk_size) % 20 == 0:
+            print(f"    scatter {e}/{N} ({100*e/N:.0f}%)", flush=True)
+    if verbose:
+        print(f"    scatter took {time.time()-t:.1f}s", flush=True)
+
+    dense = dense / (dense.norm(dim=-1, keepdim=True) + 1e-8)
+    torch.cuda.empty_cache()
+    return dense, idx_to_pos, unique
+
+
+def sparse_sim_with_lookup(q_sparse, lookup, cand_indices, device="cuda"):
+    """用预算好的 lookup 算 query 与 cand 子集余弦 (全 GPU)"""
+    c_dense_norm, idx_to_pos, unique = lookup
+    acts, inds = q_sparse
+    V = c_dense_norm.shape[1]
+
+    acts = acts.float().to(device)
+    inds = inds.to(device)
+    max_idx_in_table = idx_to_pos.shape[0] - 1
+    valid = (inds <= max_idx_in_table) & (idx_to_pos[inds.clamp(max=max_idx_in_table)] >= 0)
+    acts_v = acts[valid]
+    pos_v = idx_to_pos[inds[valid]]
+
+    q_d = torch.zeros(V, dtype=torch.float32, device=device)
+    q_d.scatter_add_(0, pos_v, acts_v)
+    q_d = q_d / (q_d.norm() + 1e-8)
+
+    c_subset = c_dense_norm[cand_indices]      # [N_subset, V] GPU
+    sims = c_subset @ q_d                      # [N_subset] GPU
     return sims
 
 
 # ============================================================
-# 抽样 + 评估 (一个 query)
+# 抽样 + 评估 (一个 query) - 全 GPU
 # ============================================================
 def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
-                   q_orig, c_orig_all,         # 原始路径
-                   q_sae=None, c_sae_all=None, # SAE 路径
-                   cid2idx=None):
-    """
-    抽 sample_ratio 比例的 candidate (保证 gold 在内), 算三路 rank.
-
-    返回 dict: {"orig": rank_global_est, "sae": ..., "avg": ...}
-    rank_global_est = rank_in_sample × (1 / sample_ratio)
-    """
+                   q_orig, c_orig_all,
+                   q_sae=None, sparse_lookup=None,
+                   cid2idx=None, device="cuda"):
     K = len(cand_cids)
-    # 抽样阈值: K 太小时直接用全集 (避免抽样退化成 1 个 candidate)
-    # 经验值: 如果 K <= 20, 全用; 否则按 sample_ratio 抽
     min_pool = 20
     if K <= min_pool:
         n_sample = K
@@ -349,20 +439,19 @@ def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
     rng.shuffle(sample_cids)
     new_gold_pos = sample_cids.index(gold_cid)
 
-    # 拿出对应 embedding
     cand_idx_in_full = [cid2idx[c] for c in sample_cids]
-    c_orig_subset = c_orig_all[cand_idx_in_full]
+    cand_idx_tensor = torch.tensor(cand_idx_in_full, dtype=torch.long, device=device)
 
-    sims_orig = cos_sim(q_orig, c_orig_subset)
+    # orig 路径 (GPU)
+    c_orig_subset = c_orig_all[cand_idx_tensor]      # GPU index
+    sims_orig = cos_sim(q_orig, c_orig_subset)        # GPU
     gold_score_orig = sims_orig[new_gold_pos]
     rank_orig = int((sims_orig > gold_score_orig).sum().item()) + 1
-
     out = {"orig_rank_sample": rank_orig, "n_sample": n_sample, "K": K}
 
-    sims_sae = None
-    if q_sae is not None and c_sae_all:
-        c_sae_subset = [c_sae_all[i] for i in cand_idx_in_full]
-        sims_sae = sparse_sim(q_sae, c_sae_subset)
+    # sae 路径 (GPU)
+    if q_sae is not None and sparse_lookup is not None:
+        sims_sae = sparse_sim_with_lookup(q_sae, sparse_lookup, cand_idx_tensor, device)
         gold_score_sae = sims_sae[new_gold_pos]
         rank_sae = int((sims_sae > gold_score_sae).sum().item()) + 1
         out["sae_rank_sample"] = rank_sae
@@ -372,7 +461,6 @@ def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
         rank_avg = int((sims_avg > gold_score_avg).sum().item()) + 1
         out["avg_rank_sample"] = rank_avg
 
-    # 还原全局 rank: rank_global ≈ rank_sample / sample_ratio
     actual_ratio = n_sample / K
     scale = 1.0 / actual_ratio
     out["scale"] = scale
@@ -384,15 +472,6 @@ def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
 
 
 def aggregate(per_query_results, ks=(1, 5, 10)):
-    """从 per-query rank 列表算 top-k acc + MRR + acc(击败比例).
-
-    指标:
-      - top-k:    抽样池内 rank <= k 的比例
-      - mrr:      抽样池内 1/rank 平均
-      - acc:      gold 击败的 candidate 比例 = 1 - rank_sample / n_sample
-                  (= 1 - rank_global / K, 数学等价)
-                  rank=1 时 acc 最接近 1; rank=n_sample 时 acc=0
-    """
     metrics = {}
     for key in ("orig", "sae", "avg"):
         sk_sample = f"{key}_rank_sample"
@@ -402,17 +481,12 @@ def aggregate(per_query_results, ks=(1, 5, 10)):
         ranks_sample = np.array([r[sk_sample] for r in per_query_results])
         ranks_global = np.array([r[sk_global] for r in per_query_results])
         n_samples = np.array([r["n_sample"] for r in per_query_results])
-        Ks = np.array([r["K"] for r in per_query_results])
 
         m = {}
-        # 抽样池内的指标 (主指标)
         for k in ks:
             m[f"top{k}"] = float((ranks_sample <= k).mean())
         m["mrr"] = float((1.0 / ranks_sample).mean())
-        # acc: gold 击败 candidate 的比例 (越大越好, 1=完美, 0=最差)
-        # 用 n_sample-1 做分母, 排除 gold 自己; rank=1 时 acc=1
         m["acc"] = float((1.0 - (ranks_sample - 1) / np.maximum(n_samples - 1, 1)).mean())
-        # 全局还原 (供参考)
         for k in ks:
             m[f"top{k}_global"] = float((ranks_global <= k).mean())
         m["mrr_global"] = float((1.0 / ranks_global).mean())
@@ -428,37 +502,35 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--num_queries", type=int, default=200)
-    parser.add_argument("--sample_ratio", type=float, default=0.2,
-                        help="每个 query 的 candidate 抽样比例 (0.2 = 抽 20%)")
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--sample_ratio", type=float, default=0.2)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--output_dir", default="outputs/zero_shot")
     parser.add_argument("--ckpt", default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume", action="store_true",
-                        help="跳过 output_dir 下已有 JSON 中的数据集 (用于中断后续跑)")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no_sae", action="store_true")
+    parser.add_argument("--gpu_monitor_interval", type=float, default=300)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[eval] sample_ratio={args.sample_ratio}", flush=True)
 
-    # ---- resume: 从已有 JSON 加载已完成的数据集 ----
     out_json = os.path.join(args.output_dir, "zero_shot_results.json")
     all_results = {}
     if args.resume and os.path.isfile(out_json):
         try:
             with open(out_json) as f:
                 all_results = json.load(f)
-            print(f"[eval] resume: loaded {len(all_results)} completed datasets "
-                  f"from {out_json}", flush=True)
-            print(f"[eval] already done: {list(all_results.keys())}", flush=True)
+            print(f"[eval] resume: loaded {len(all_results)} datasets: "
+                  f"{list(all_results.keys())}", flush=True)
         except Exception as e:
-            print(f"[eval] resume failed to load {out_json}: {e}", flush=True)
+            print(f"[eval] resume load failed: {e}", flush=True)
 
-    # 过滤掉已完成的数据集
     datasets_to_run = [d for d in args.datasets if d not in all_results]
     if not datasets_to_run:
-        print(f"[eval] all datasets already done, nothing to do", flush=True)
+        print("[eval] all datasets done", flush=True)
         try:
             plot_results(all_results, os.path.join(args.output_dir, "zero_shot.png"))
         except Exception as e:
@@ -467,46 +539,76 @@ def main():
     print(f"[eval] will run: {datasets_to_run}", flush=True)
 
     print("[eval] loading model + SAE ...", flush=True)
+    if torch.cuda.is_available():
+        orig_dm = cfg.model.device_map
+        cfg.model.device_map = {"": 0}
+        print(f"[eval] override device_map: {orig_dm} -> {{'': 0}}", flush=True)
+
     model, processor = load_model(cfg)
     if args.ckpt:
         from model import load_adapter
         model = load_adapter(model, args.ckpt)
     device = next(model.parameters()).device
-    sae = load_sae(cfg, device=device)
-    sae_hook = attach_sae_hook(model, sae, cfg) if sae is not None else None
+    if device.type != "cuda":
+        raise RuntimeError(
+            f"Model on {device}, not GPU! 检查 torch.cuda / CUDA_VISIBLE_DEVICES / "
+            f"device_map (当前 {cfg.model.device_map}). 可见 GPU: {torch.cuda.device_count()}")
+    print(f"[eval] model device: {device}", flush=True)
+
+    if args.no_sae:
+        print("[eval] --no_sae: orig path only", flush=True)
+        sae, sae_hook = None, None
+    else:
+        sae = load_sae(cfg, device=device)
+        sae_hook = attach_sae_hook(model, sae, cfg) if sae is not None else None
 
     pool_layer_idx = getattr(cfg.train, "pool_layer_idx", cfg.sae.layer_idx)
     extractor = Extractor(model, sae_hook, pool_layer_idx, device)
     collate = build_collate(processor, max_length=cfg.data.max_length)
+
+    gpu_monitor = None
+    if args.gpu_monitor_interval > 0:
+        gpu_monitor = GPUMonitor(interval=args.gpu_monitor_interval)
+        gpu_monitor.start()
+        print(f"[eval] GPU monitor every {args.gpu_monitor_interval}s", flush=True)
 
     for ds_name in datasets_to_run:
         print(f"\n[eval] ====== {ds_name} ======", flush=True)
         try:
             queries, cands, qid2cands, qid2gold_pos = collect_units(
                 cfg.data.data_root, ds_name, cfg.data.images_root,
-                num_query_sample=args.num_queries, seed=args.seed,
-            )
+                num_query_sample=args.num_queries, seed=args.seed)
         except Exception as e:
             print(f"[eval] skip {ds_name}: {e}", flush=True)
             continue
 
         avg_K = sum(len(qid2cands[q["qid"]]) for q in queries) / len(queries)
-        print(f"[eval]   queries: {len(queries)}, unique candidates: {len(cands)}, "
-              f"avg K per query: {avg_K:.0f}", flush=True)
+        print(f"[eval]   queries: {len(queries)}, unique cands: {len(cands)}, "
+              f"avg K: {avg_K:.0f}", flush=True)
 
         try:
-            # 一次性 forward 所有 unique candidate
+            t_fwd = time.time()
             cid_list, c_orig, c_sae = extractor.encode(
-                UnitDataset(cands), args.batch_size, collate, desc="cand")
+                UnitDataset(cands), args.batch_size, collate,
+                desc="cand", num_workers=args.num_workers)
             qid_list, q_orig, q_sae = extractor.encode(
-                UnitDataset(queries), args.batch_size, collate, desc="query")
+                UnitDataset(queries), args.batch_size, collate,
+                desc="query", num_workers=args.num_workers)
+            print(f"[eval]   forward (encode) took {time.time()-t_fwd:.1f}s", flush=True)
             cid2idx = {c: i for i, c in enumerate(cid_list)}
 
-            # 逐 query 抽样 + 算 rank
-            print(f"[eval]   computing ranks (sample_ratio={args.sample_ratio})...",
-                  flush=True)
+            sparse_lookup = None
+            if c_sae and q_sae:
+                print("[eval]   building sparse lookup ...", flush=True)
+                t_lk = time.time()
+                sparse_lookup = build_sparse_lookup(c_sae, device=str(device))
+                print(f"[eval]   sparse lookup built in {time.time()-t_lk:.1f}s",
+                      flush=True)
+
+            print(f"[eval]   computing ranks ...", flush=True)
             rng = random.Random(args.seed)
             per_q = []
+            t_rank = time.time()
             for qi, qid in enumerate(qid_list):
                 cand_cids = qid2cands[qid]
                 if not cand_cids:
@@ -515,57 +617,55 @@ def main():
                     cand_cids, qid2gold_pos[qid], args.sample_ratio, rng,
                     q_orig=q_orig[qi], c_orig_all=c_orig,
                     q_sae=q_sae[qi] if q_sae else None,
-                    c_sae_all=c_sae,
-                    cid2idx=cid2idx,
-                )
+                    sparse_lookup=sparse_lookup,
+                    cid2idx=cid2idx, device=str(device))
                 per_q.append(r)
+            print(f"[eval]   ranks computed in {time.time()-t_rank:.1f}s", flush=True)
+
+            del sparse_lookup
+            torch.cuda.empty_cache()
 
             metrics = aggregate(per_q)
             for key, m in metrics.items():
                 print(f"[eval]   {key}:  top1={m['top1']:.4f}  top5={m['top5']:.4f}  "
-                      f"top10={m['top10']:.4f}  mrr={m['mrr']:.4f}  "
-                      f"acc={m['acc']:.4f}", flush=True)
+                      f"top10={m['top10']:.4f}  mrr={m['mrr']:.4f}  acc={m['acc']:.4f}",
+                      flush=True)
 
             all_results[ds_name] = {
-                "n_queries": len(per_q),
-                "avg_K": avg_K,
-                "sample_ratio": args.sample_ratio,
-                **metrics,
+                "n_queries": len(per_q), "avg_K": avg_K,
+                "sample_ratio": args.sample_ratio, **metrics,
             }
         except Exception as e:
             import traceback; traceback.print_exc()
-            print(f"[eval] {ds_name} failed: {e}, continuing to next dataset",
-                  flush=True)
+            print(f"[eval] {ds_name} failed: {e}, continue", flush=True)
+            torch.cuda.empty_cache()
             continue
 
-        # 每个数据集跑完就立即存盘, 避免后面崩了前面白干
         with open(out_json, "w") as f:
             json.dump(all_results, f, indent=2)
-        print(f"[eval]   saved partial results -> {out_json}", flush=True)
-
-        # 同时增量更新图 (方便中途观察)
+        print(f"[eval]   saved -> {out_json}", flush=True)
         try:
             plot_results(all_results, os.path.join(args.output_dir, "zero_shot.png"))
         except Exception as e:
-            print(f"[plot] partial plot failed: {e}", flush=True)
+            print(f"[plot] partial failed: {e}", flush=True)
 
-    print(f"\n[eval] all done. final results: {out_json}", flush=True)
+    print(f"\n[eval] all done. {out_json}", flush=True)
     extractor.close()
+    if gpu_monitor is not None:
+        gpu_monitor.stop()
 
 
 def plot_results(results, out_path):
     import matplotlib.pyplot as plt
     datasets = list(results.keys())
     if not datasets: return
-    metric_keys = [("top1", "Top-1"), ("top5", "Top-5"),
-                   ("top10", "Top-10"), ("mrr", "MRR"),
-                   ("acc", "Acc (beat ratio)")]
+    metric_keys = [("top1", "Top-1"), ("top5", "Top-5"), ("top10", "Top-10"),
+                   ("mrr", "MRR"), ("acc", "Acc (beat ratio)")]
     paths_info = [("orig", "Original Hidden", "#3b82f6", "o"),
-                  ("sae",  "SAE Sparse",      "#f97316", "s"),
-                  ("avg",  "Avg (both)",      "#10b981", "^")]
-
+                  ("sae", "SAE Sparse", "#f97316", "s"),
+                  ("avg", "Avg (both)", "#10b981", "^")]
     fig, axes = plt.subplots(1, len(metric_keys),
-                              figsize=(4.5 * len(metric_keys), 5), sharey=True)
+                             figsize=(4.5 * len(metric_keys), 5), sharey=True)
     x = np.arange(len(datasets))
     for ax, (mkey, mname) in zip(axes, metric_keys):
         for pk, lbl, color, marker in paths_info:
@@ -580,8 +680,8 @@ def plot_results(results, out_path):
         ax.set_ylim(0, 1.0); ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=9)
     ratios = set(r["sample_ratio"] for r in results.values())
-    fig.suptitle(f"Zero-shot retrieval baseline "
-                 f"(sample_ratio={list(ratios)[0] if len(ratios)==1 else ratios})",
+    fig.suptitle(f"Zero-shot retrieval baseline (sample_ratio="
+                 f"{list(ratios)[0] if len(ratios)==1 else ratios})",
                  y=1.02, fontsize=14)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
