@@ -12,8 +12,8 @@ sae:
   lambda_align: 0.0
 
 data:
-  data_root: ../../MMEB-eval
-  images_root: ../../MMEB-eval/images
+  data_root: ../MMEB-eval
+  images_root: ../MMEB-eval/images
   # 示例: 只用这两个数据集训练; 改成 null 用全部
   train_datasets: ["ChartQA", "MSCOCO"]
   eval_datasets: ["ChartQA"]

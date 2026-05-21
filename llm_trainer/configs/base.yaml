@@ -32,8 +32,8 @@ sae:
 # ==== 数据 (MMEB 风格) ====
 data:
   # MMEB 数据根目录,下面每个子目录是一个数据集 (含 *.parquet)
-  data_root: ../../MMEB-eval
-  images_root: ../../MMEB-eval/images
+  data_root: ../MMEB-eval
+  images_root: ../MMEB-eval/images
   # 训练 / 评估各用哪些数据集 (子目录名)。null 表示全用
   train_datasets: null
   eval_datasets: null
@@ -45,7 +45,7 @@ data:
   # 单条 (query 或 candidate) 的文本最大 token 数 (仅对无图样本生效, 有图样本不截断)
   # 有图样本会被 processor 自动扩展到 ~3000 tokens, 不受此值限制
   max_length: 3500
-  num_workers: 4
+  num_workers: 64
 
 # ==== 训练 ====
 train:
