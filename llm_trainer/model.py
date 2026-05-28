@@ -15,6 +15,7 @@ model.py
 """
 import os
 import sys
+import types
 import importlib.util
 import torch
 import torch.nn as nn
@@ -35,6 +36,70 @@ DEFAULT_LLAVA_PATH = os.path.join(_LVLMS_ROOT, "pretrained_models", "llama3-llav
 DEFAULT_SAE_MODULE = os.path.join(_LVLMS_ROOT, "sae_trainer", "sae_model.py")
 DEFAULT_SAE_CKPT_DIR = os.path.join(_LVLMS_ROOT, "sae_trainer", "finetune_models",
                                     "llama3-llava-next-8b-hf-sae-131k")
+
+
+# ============================================================
+# 0.5 双向注意力改造 (causal -> bidirectional)
+# ============================================================
+def _find_llama_model(model):
+    """
+    从可能被 PeftModel / LlavaNext 多层包装的 model 中定位到真正的
+    LlamaModel (含 .layers 和 ._update_causal_mask 的那个对象)。
+    """
+    # 先剥掉 PeftModel 的外壳
+    base = model.base_model.model if isinstance(model, PeftModel) else model
+
+    # 再从 LlavaNext 结构中找 language_model.model (= LlamaModel)
+    for attr_chain in [
+        ("language_model", "model"),
+        ("language_model",),
+        ("model", "language_model", "model"),
+        ("model", "language_model"),
+    ]:
+        obj = base
+        try:
+            for a in attr_chain:
+                obj = getattr(obj, a)
+            # 确认找到的确实是 LlamaModel (有 layers 和 _update_causal_mask)
+            if hasattr(obj, "layers") and hasattr(obj, "_update_causal_mask"):
+                return obj
+        except AttributeError:
+            continue
+    return None
+
+
+def _enable_bidirectional_attention(model):
+    """
+    把 LLaMA 的因果注意力改成双向注意力,适配检索/embedding 任务。
+
+    改动点:
+      1) monkey-patch _update_causal_mask -> 返回 None (不施加下三角 mask)
+         padding 位置的屏蔽由外部 attention_mask 处理,不受影响。
+      2) 每层 self_attn.is_causal = False (SDPA 路径需要,否则它会自己加 causal mask)
+
+    对 trainer / SAE hook 完全透明: 它们只看 hidden state 输出,不关心注意力类型。
+    """
+    base_lm = _find_llama_model(model)
+    if base_lm is None:
+        print("[model] WARNING: 无法定位 LlamaModel, 跳过双向注意力改造", flush=True)
+        return
+
+    # 1) 干掉 causal mask 生成
+    def _no_causal_mask(self, *args, **kwargs):
+        return None
+
+    base_lm._update_causal_mask = types.MethodType(_no_causal_mask, base_lm)
+
+    # 2) 各层 attention 的 is_causal 标志也关掉
+    n_patched = 0
+    for layer in base_lm.layers:
+        if hasattr(layer.self_attn, "is_causal"):
+            layer.self_attn.is_causal = False
+            n_patched += 1
+
+    print(f"[model] bidirectional attention enabled "
+          f"(_update_causal_mask=None, is_causal=False on {n_patched} layers)",
+          flush=True)
 
 
 # ============================================================
@@ -77,12 +142,16 @@ def load_model(cfg):
               f"targets={list(cfg.model.lora.target_modules)}", flush=True)
         model.print_trainable_parameters()
 
+    # ---- 双向注意力: 默认关闭, 可通过 cfg.model.bidirectional=true 开启 ----
+    if getattr(cfg.model, "bidirectional", False):
+        _enable_bidirectional_attention(model)
+
     return model, processor
 
 
 def load_adapter(model, adapter_path):
-    """从已有 adapter 目录加载 LoRA 权重(用于评估/续训)"""
-    return PeftModel.from_pretrained(model, adapter_path)
+    """从已有 adapter 目录加载 LoRA 权重(用于续训/评估)"""
+    return PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
 
 
 # ============================================================
@@ -311,12 +380,34 @@ class SAEHook:
 
         # 优先用 encode + decode 路径(跳过 SAE 的训练专用 loss 计算, 如 fvu/auxk_loss)
         if hasattr(self.sae, "encode") and hasattr(self.sae, "decode"):
-            enc = self.sae.encode(x)
-            # encode 可能返回 NamedTuple(top_acts, top_indices) 或 (vals, idx) tuple
-            if isinstance(enc, tuple):
-                top_acts, top_indices = enc[0], enc[1]
+            # 关键省显存: SAE encode 内部要算预激活 [M, L, num_latents=131072],
+            # M=max_candidates+1 (如 17) 时一次性算 = [17,L,131072] ~13GB + relu 副本 -> OOM。
+            # 按第 0 维 (M 条序列) 分块 encode, 每块算完 topk 得到稀疏小结果立刻释放预激活,
+            # 峰值降到 1/n_chunks。保住 max_candidates 不变, 只是分批过 SAE。
+            M = x.shape[0]
+            # 每块最多 chunk_sz 条序列 (经验值: 4 条带图 L~1490 时预激活 ~3GB, 安全)
+            chunk_sz = getattr(self, "encode_chunk_size", 4)
+            if M <= chunk_sz:
+                enc = self.sae.encode(x)
+                if isinstance(enc, tuple):
+                    top_acts, top_indices = enc[0], enc[1]
+                else:
+                    top_acts, top_indices = enc, None
             else:
-                top_acts, top_indices = enc, None
+                acts_list, idx_list = [], []
+                for s in range(0, M, chunk_sz):
+                    e = min(s + chunk_sz, M)
+                    enc_c = self.sae.encode(x[s:e])
+                    if isinstance(enc_c, tuple):
+                        a_c, i_c = enc_c[0], enc_c[1]
+                    else:
+                        a_c, i_c = enc_c, None
+                    acts_list.append(a_c)
+                    if i_c is not None:
+                        idx_list.append(i_c)
+                top_acts = torch.cat(acts_list, dim=0)
+                top_indices = torch.cat(idx_list, dim=0) if idx_list else None
+                del acts_list, idx_list
 
             if top_indices is not None and self.replace:
                 x_hat = self.sae.decode(top_acts, top_indices)
@@ -363,7 +454,7 @@ def attach_sae_hook(model, sae, cfg):
     if sae is None:
         return None
 
-    base = model.base_model.model if hasattr(model, "base_model") else model
+    base = model.base_model.model if isinstance(model, PeftModel) else model
 
     layers = None
     for path in [

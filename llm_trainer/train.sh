@@ -16,10 +16,23 @@
 
 set -u
 
+# 中文输出 + 显存碎片缓解 (报错信息直接建议 expandable_segments)
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONIOENCODING=utf-8
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+# DDP 子进程完整 traceback (否则只显示 ChildFailedError 外壳, 看不到真错误)
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCHELASTIC_ERROR_FILE=/tmp/torch_elastic_error.json
+export NCCL_DEBUG=WARN
+# 调试时设 DEBUG_SYNC=1 开 CUDA_LAUNCH_BLOCKING (定位精确报错行, 但会拖慢训练)
+[ "${DEBUG_SYNC:-0}" = "1" ] && export CUDA_LAUNCH_BLOCKING=1
+
 # ----------------------------------------------------------------------------
 # 默认参数
 # ----------------------------------------------------------------------------
-GPUS="${GPUS:-4,5}"
+GPUS="${GPUS:-0,1}"
 CONFIG="configs/exp_lora_sae.yaml"
 MODE="train"
 CKPT=""
@@ -184,7 +197,7 @@ else
     err "训练失败, 退出码: $RC"
     err "  日志: $LOG_FILE"
     err "  尾部:"
-    tail -30 "$LOG_FILE" | sed 's/^/    /'
+    tail -80 "$LOG_FILE" | sed 's/^/    /'
 fi
 
 [ "$DEBUG" = "1" ] && rm -f configs/_debug.yaml

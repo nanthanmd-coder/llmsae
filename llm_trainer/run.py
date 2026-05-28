@@ -73,7 +73,16 @@ def main():
     # ---- 创建 accelerator (单卡多卡都创建, 单卡时它就是个空壳) ----
     accelerator = None
     if _HAS_ACCELERATE:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # static_graph=True: 解决 "marked ready twice" 错误。原因是 SAE 路径和 orig
+        #   路径都经过 layer 24 的 LoRA 参数, 两条路径 backward 让 DDP 看到该参数被标记
+        #   两次。叠加 gradient checkpointing 的 reentrant backward, DDP 默认不支持。
+        #   静态图模式让 DDP 知道每 iter 图结构不变, 正确处理参数复用。
+        # 注意: static_graph 与 find_unused_parameters 不能同时为 True, 关掉后者
+        #   (静态图模式下 DDP 自己会在第一个 iter 探测未用参数)。
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=False,
+            static_graph=True,
+        )
         accelerator = Accelerator(
             gradient_accumulation_steps=cfg.train.grad_accum_steps,
             kwargs_handlers=[ddp_kwargs],
@@ -90,18 +99,57 @@ def main():
               flush=True)
 
     # ---- 模型加载 ----
-    # 多卡 DDP: 每张卡加载完整模型, device_map 不能用 auto, 用单 device
-    # 单卡:     沿用 cfg 里的 device_map (默认 auto)
+    # 多卡 DDP: 每张卡加载完整模型到自己的 GPU
+    # 单卡:     强制整个模型到 cuda:0 (device_map=auto 会把层拆到多设备甚至 CPU
+    #           offload, 训练时 forward 在设备间来回搬, 极慢甚至卡死)
     if is_dist:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         cfg.model.device_map = {"": local_rank}
         if is_main:
             print("[run] DDP mode: each process loads full model to its own GPU",
                   flush=True)
+    else:
+        # 单卡: 强制单 device, 不用 auto
+        if torch.cuda.is_available():
+            cfg.model.device_map = {"": 0}
+            print("[run] 单卡: device_map -> {'': 0} (避免 auto 拆分/CPU offload 卡死)",
+                  flush=True)
 
-    model, processor = load_model(cfg)
+    # ---- 关键: 续训时不在 load_model 里注入 LoRA, 由 load_adapter 从 checkpoint 加载 ----
     if args.ckpt:
-        model = load_adapter(model, args.ckpt)
+        cfg.model.lora.enable = False          # 禁止 load_model 注入新 LoRA
+        model, processor = load_model(cfg)     # 只加载基座 LLaVA
+        model = load_adapter(model, args.ckpt) # 从 checkpoint 加载 LoRA (is_trainable=True)
+    else:
+        model, processor = load_model(cfg)
+
+    # ---- 关键省显存: 训练/评估只用中间层 hidden (通过 hook), 完全不用 lm_head 的 logits。
+    # LLaVA forward 默认会算 logits [M, L, vocab=128256], transformers v4.46+ 训练时
+    # 强制 FP32 -> 单这一项 ~13GB, DDP 的 _DDPSink 还会 clone 一份 -> ~26GB -> OOM。
+    # 把 lm_head 换成 Identity: forward 到 layer 24 的 hook 照常抓 hidden, 但不再算
+    # 大 logits, DDP clone 的也只是小张量。layer 0~24 计算图完整, 梯度照常回传 LoRA。
+    def _replace_lm_head_with_identity(m):
+        base = m.base_model.model if hasattr(m, "base_model") else m
+        for path in [
+            lambda x: x.language_model,           # LLaVA-Next: language_model.lm_head
+            lambda x: x.model.language_model,
+            lambda x: x,
+        ]:
+            try:
+                lm = path(base)
+                if hasattr(lm, "lm_head") and not isinstance(lm.lm_head, torch.nn.Identity):
+                    old = lm.lm_head
+                    lm.lm_head = torch.nn.Identity()
+                    if is_main:
+                        print(f"[run] lm_head -> Identity (省 logits 显存), "
+                              f"原 lm_head: {type(old).__name__}", flush=True)
+                    return True
+            except AttributeError:
+                continue
+        if is_main:
+            print("[run] 警告: 没找到 lm_head, 未替换 (logits 仍会算, 可能 OOM)", flush=True)
+        return False
+    _replace_lm_head_with_identity(model)
 
     # SAE 跟 model 放同一张卡
     device = next(model.parameters()).device

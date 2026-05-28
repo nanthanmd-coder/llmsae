@@ -8,6 +8,7 @@ model:
   base_path: ../pretrained_models/llama3-llava-next-8b-hf
   torch_dtype: bfloat16
   device_map: auto
+  bidirectional: false
   lora:
     enable: true
     r: 16
@@ -39,19 +40,19 @@ data:
   eval_datasets: null
   # 每条样本最多保留多少个候选 (避免长尾样本拖慢训练)
   # 注意: LLaVA-Next 单图 ~2880 个 image tokens, max_candidates 不能太大
-  max_candidates: 12
+  max_candidates: 16
   # parquet 里若有指示真值列下标的列名,填这里;没有就保持 null (默认真值在第 0 个)
   gold_idx_col: null
   # 单条 (query 或 candidate) 的文本最大 token 数 (仅对无图样本生效, 有图样本不截断)
   # 有图样本会被 processor 自动扩展到 ~3000 tokens, 不受此值限制
   max_length: 3500
-  num_workers: 64
+  num_workers: 16
 
 # ==== 训练 ====
 train:
-  epochs: 2
+  epochs: 10
   # MMEB 样本数;实际展平后 batch 内条数 = batch_size * (1 + K_avg)
-  batch_size: 4
+  batch_size: 2
   grad_accum_steps: 16
   lr: 1.0e-4
   weight_decay: 0.0

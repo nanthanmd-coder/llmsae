@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from omegaconf import OmegaConf
 from PIL import Image
+from peft import PeftModel
 
 from model import load_model, load_sae, attach_sae_hook
 from data import (
@@ -81,6 +82,42 @@ class GPUMonitor:
                 print(f"  [gpu monitor error] {e}", flush=True)
             if self._stop.wait(self.interval):
                 break
+
+
+def gpu_mem(tag="", device=None):
+    """打印当前 GPU 显存占用 (已分配 / 已保留 / 剩余 / 总量)。
+    在大操作前后调用, 方便定位过载点和判断余量。"""
+    if not torch.cuda.is_available():
+        return
+    try:
+        dev = 0 if device is None else (device.index if hasattr(device, "index")
+                                        and device.index is not None else 0)
+        alloc = torch.cuda.memory_allocated(dev) / 1e9
+        reserved = torch.cuda.memory_reserved(dev) / 1e9
+        free, total = torch.cuda.mem_get_info(dev)
+        free_gb, total_gb = free / 1e9, total / 1e9
+        print(f"    [mem{(' ' + tag) if tag else ''}] "
+              f"allocated={alloc:.1f}GB reserved={reserved:.1f}GB "
+              f"free={free_gb:.1f}GB / total={total_gb:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"    [mem] error: {e}", flush=True)
+
+
+def estimate_mem(desc, n_elements, bytes_per=4):
+    """预测某个张量/操作需要多少显存, 并跟当前剩余对比给出提示。"""
+    need_gb = n_elements * bytes_per / 1e9
+    msg = f"    [mem-predict] {desc}: 需要 ~{need_gb:.2f}GB"
+    if torch.cuda.is_available():
+        try:
+            free, _ = torch.cuda.mem_get_info()
+            free_gb = free / 1e9
+            ratio = need_gb / max(free_gb, 1e-6)
+            flag = " ⚠️超过剩余70%!" if need_gb > free_gb * 0.7 else ""
+            msg += f" (剩余 {free_gb:.1f}GB, 占 {ratio*100:.0f}%{flag})"
+        except Exception:
+            pass
+    print(msg, flush=True)
+    return need_gb
 
 
 def load_config(path):
@@ -251,7 +288,7 @@ class Extractor:
         self.sae_hook = sae_hook
         self.device = device
         self._cache = {}
-        base = model.base_model.model if hasattr(model, "base_model") else model
+        base = model.base_model.model if isinstance(model, PeftModel) else model
         layers = None
         for path in [
             lambda m: m.language_model.model.layers,
@@ -285,6 +322,8 @@ class Extractor:
         n = len(loader)
         t0 = time.time()
         self.model.eval()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         for i, batch in enumerate(loader):
             bids = batch.pop("ids")
             batch = {k: v.to(self.device, non_blocking=True)
@@ -303,19 +342,45 @@ class Extractor:
                 ta = self.sae_hook.cache.get("z")
                 ti = self.sae_hook.cache.get("z_indices")
                 if ta is not None and ti is not None:
-                    mask = am.unsqueeze(-1).to(ta.dtype)
-                    ta_m = ta * mask / am.sum(1, keepdim=True).unsqueeze(-1).clamp_min(1.0)
+                    am_b = batch["attention_mask"]            # [B, L] 0/1
+                    denom = am_b.sum(1).clamp_min(1.0)        # [B]
                     B, L, K = ta.shape
-                    pa = ta_m.reshape(B, L * K)        # GPU
-                    pi = ti.reshape(B, L * K)          # GPU
                     for b in range(B):
-                        # 留在 GPU
-                        saes.append((pa[b].clone(), pi[b].clone()))
+                        valid_tok = am_b[b].bool()            # [L]
+                        a = ta[b][valid_tok].reshape(-1).float()   # [L_valid*K] 激活值
+                        idx = ti[b][valid_tok].reshape(-1).long()  # [L_valid*K] feature 编号
+                        # 关键: 先把 token 级激活 pool 成样本级稀疏向量。
+                        # 同一 feature 在多个 token 的激活累加 -> nnz 从 L*K
+                        # 降到 unique feature 数 (带图样本能省几十~上百倍)。
+                        uniq, inv = torch.unique(idx, return_inverse=True)
+                        pooled = torch.zeros(uniq.shape[0], device=a.device, dtype=a.dtype)
+                        pooled.scatter_add_(0, inv, a)
+                        pooled = pooled / denom[b]            # mean-pool 归一化
+                        nz = pooled != 0                      # 去掉 pool 后的 0
+                        # 搬 CPU 存 (省 GPU 显存), build CSR 时再上 GPU
+                        saes.append((pooled[nz].cpu(), uniq[nz].cpu()))
+
+            # 清掉本 batch 的 GPU 中间量 (SAE 预激活 hook cache 等), 防 reserved 累积
+            self._cache.clear()
+            if self.sae_hook is not None and self.sae_hook.cache:
+                self.sae_hook.cache.clear()
+            del batch, h, am, emb
+            if 'ta' in dir() and ta is not None:
+                del ta, ti
+            # 每 50 个 batch 强制把 reserved 显存还给系统 (防 caching allocator 占满)
+            if (i + 1) % 50 == 0:
+                torch.cuda.empty_cache()
 
             ids.extend(bids)
             if (i + 1) % max(n // 10, 1) == 0 or i == n - 1:
+                a = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                r = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+                pk = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
                 print(f"  [{desc}] {i+1}/{n} ({100*(i+1)/n:.0f}%) "
-                      f"elapsed={time.time()-t0:.0f}s", flush=True)
+                      f"elapsed={time.time()-t0:.0f}s "
+                      f"alloc={a:.1f}G reserved={r:.1f}G peak={pk:.1f}G "
+                      f"free={free:.1f}G saes={len(saes)}", flush=True)
         origs = torch.cat(origs, dim=0)
         return ids, origs, saes
 
@@ -361,22 +426,32 @@ def build_sparse_lookup(sparse_list, device="cuda", chunk_size=128, verbose=True
     idx_to_pos = torch.full((max_idx + 1,), -1, dtype=torch.long, device=device)
     idx_to_pos[unique] = torch.arange(V, device=device)
 
-    mem_gb = N * V * 4 / 1e9
+    mem_gb = N * V * 2 / 1e9   # fp16
     if verbose:
-        print(f"    allocating dense [N={N}, V={V}] fp32 = {mem_gb:.1f} GB", flush=True)
-    dense = torch.zeros(N, V, dtype=torch.float32, device=device)
+        print(f"    allocating dense [N={N}, V={V}] fp16 = {mem_gb:.1f} GB", flush=True)
+
+    # 显存安全检查: 如果 dense 需要的显存超过剩余可用的 70%, 放弃 (返回 None)
+    if device != "cpu" and torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        free_gb = free / 1e9
+        if mem_gb > free_gb * 0.7:
+            print(f"    [WARN] dense 需要 {mem_gb:.1f}GB 但只剩 {free_gb:.1f}GB, "
+                  f"跳过 SAE 路径 (该数据集只有 orig 结果)", flush=True)
+            return None
+
+    dense = torch.zeros(N, V, dtype=torch.float16, device=device)
 
     t = time.time()
     for s in range(0, N, chunk_size):
         e = min(s + chunk_size, N)
         max_len = max(sparse_list[i][0].shape[0] for i in range(s, e))
         chunk = e - s
-        acts_chunk = torch.zeros(chunk, max_len, dtype=torch.float32, device=device)
+        acts_chunk = torch.zeros(chunk, max_len, dtype=torch.float16, device=device)
         inds_chunk = torch.full((chunk, max_len), int(unique[0].item()),
                                 dtype=torch.long, device=device)
         for k, i in enumerate(range(s, e)):
             L_i = sparse_list[i][0].shape[0]
-            acts_chunk[k, :L_i] = sparse_list[i][0].float()
+            acts_chunk[k, :L_i] = sparse_list[i][0].half()
             inds_chunk[k, :L_i] = sparse_list[i][1].long()
         pos_chunk = idx_to_pos[inds_chunk]
         dense[s:e].scatter_add_(1, pos_chunk, acts_chunk)
@@ -389,6 +464,130 @@ def build_sparse_lookup(sparse_list, device="cuda", chunk_size=128, verbose=True
     dense = dense / (dense.norm(dim=-1, keepdim=True) + 1e-8)
     torch.cuda.empty_cache()
     return dense, idx_to_pos, unique
+
+
+def sparse_sim_local(q_sparse, cand_sparse_list, device="cuda"):
+    """
+    只稠密化"这个 query 用到的 cand 子集"(n_sample 个), 不建全池 dense。
+    显存只占 [n_sample, V_local], V_local 是这一小撮的 indices 并集, 远小于全池 V。
+
+    q_sparse:         (acts, inds)            单个 query 的稀疏激活
+    cand_sparse_list: list of (acts, inds)    该 query 抽样的 n_sample 个 cand
+    返回: sims [n_sample]
+    """
+    q_acts, q_inds = q_sparse
+    n = len(cand_sparse_list)
+
+    # query + 这 n 个 cand 的局部 indices 并集 (小)
+    all_inds = torch.cat([q_inds] + [c[1] for c in cand_sparse_list])
+    unique = torch.unique(all_inds)
+    V_local = unique.shape[0]
+    max_idx = int(unique.max().item())
+    idx_to_pos = torch.full((max_idx + 1,), -1, dtype=torch.long, device=device)
+    idx_to_pos[unique] = torch.arange(V_local, device=device)
+
+    # query 稠密化到 V_local
+    q_d = torch.zeros(V_local, dtype=torch.float32, device=device)
+    q_d.scatter_add_(0, idx_to_pos[q_inds], q_acts.float())
+    q_d = q_d / (q_d.norm() + 1e-8)
+
+    # cand 稠密化到 [n, V_local] (V_local 小, 逐个 scatter 也快)
+    c_dense = torch.zeros(n, V_local, dtype=torch.float32, device=device)
+    for j, (acts, inds) in enumerate(cand_sparse_list):
+        c_dense[j].scatter_add_(0, idx_to_pos[inds], acts.float())
+    c_dense = c_dense / (c_dense.norm(dim=-1, keepdim=True) + 1e-8)
+
+    sims = c_dense @ q_d                  # [n]
+    return sims
+
+
+def build_sparse_csr(sparse_list, device="cuda", verbose=True):
+    """
+    用 torch.sparse 把整个 candidate 池建成一个 CSR 稀疏矩阵 [N, V_total], 行已 L2 归一化。
+    全池只建一次, 所有 query 复用。底层只存非零, 显存 = O(非零总数), 不是 O(N*V)。
+
+    sparse_list: list of (acts, inds)   每个 candidate 的稀疏激活 (在 GPU)
+    返回: (csr_mat[N, V_total] 行归一化 CSR, V_total)
+          显存不足或空时返回 None
+    """
+    if len(sparse_list) == 0:
+        return None
+
+    N = len(sparse_list)
+    t = time.time()
+
+    # 1) 拼所有非零的 (row, col, val)
+    rows, cols, vals = [], [], []
+    for i, (acts, inds) in enumerate(sparse_list):
+        n_nz = inds.shape[0]
+        rows.append(torch.full((n_nz,), i, dtype=torch.long, device=device))
+        cols.append(inds.long().to(device))
+        vals.append(acts.float().to(device))
+    rows = torch.cat(rows)
+    cols = torch.cat(cols)
+    vals = torch.cat(vals)
+    V_total = int(cols.max().item()) + 1
+    nnz = vals.shape[0]
+    if verbose:
+        mem_mb = nnz * (8 + 8 + 4) / 1e6   # row(long)+col(long)+val(float), COO 阶段
+        print(f"    sparse CSR: N={N}, V_total={V_total}, nnz={nnz} "
+              f"(~{mem_mb:.0f}MB COO)", flush=True)
+
+    # 显存安全检查 (COO 阶段是峰值)
+    if device != "cpu" and torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info()
+        if nnz * 20 > free * 0.7:    # 粗估 COO+CSR+coalesce 中间峰值 ~20B/nnz
+            print(f"    [WARN] 稀疏矩阵 nnz={nnz} 显存可能不足, 跳过 SAE 路径",
+                  flush=True)
+            return None
+
+    # 2) COO -> coalesce (合并同一 (row,col) 的重复 index, 累加激活)
+    coo = torch.sparse_coo_tensor(
+        torch.stack([rows, cols]), vals, (N, V_total)
+    ).coalesce()
+    del rows, cols, vals
+
+    # 3) 行 L2 归一化: 算每行平方和 -> sqrt -> 除
+    ci = coo.indices()           # [2, nnz_coalesced]
+    cv = coo.values()            # [nnz_coalesced]
+    row_idx = ci[0]
+    row_sq = torch.zeros(N, dtype=torch.float32, device=device)
+    row_sq.scatter_add_(0, row_idx, cv * cv)
+    row_norm = (row_sq.sqrt() + 1e-8)
+    cv_normed = cv / row_norm[row_idx]
+
+    # 4) 用归一化后的值重建 -> 转 CSR (matmul 快)
+    csr = torch.sparse_coo_tensor(ci, cv_normed, (N, V_total)).coalesce().to_sparse_csr()
+    if verbose:
+        print(f"    sparse CSR built in {time.time()-t:.1f}s", flush=True)
+    return csr, V_total
+
+
+def sparse_sim_csr(q_sparse, csr_mat, V_total, cand_indices, device="cuda"):
+    """
+    用预建 CSR 稀疏矩阵算 query 与 cand 子集余弦 (全 GPU, 复用 csr_mat)。
+
+    注意: CSR 不支持 index_select 按行切, 所以改成
+          "整个 CSR @ query 算全池 sims, 再用稠密索引取子集"。
+          CSR @ dense 是 torch.sparse 最成熟的操作, 稳。
+
+    q_sparse:     (acts, inds)   单个 query
+    csr_mat:      [N, V_total] 行归一化 CSR
+    cand_indices: [n_sample]    要取的 cand 行号
+    返回: sims [n_sample]
+    """
+    q_acts, q_inds = q_sparse
+    q_inds = q_inds.to(device)
+    q_acts = q_acts.to(device)
+    q_d = torch.zeros(V_total, dtype=torch.float32, device=device)
+    valid = q_inds < V_total
+    q_d.scatter_add_(0, q_inds[valid].long(), q_acts[valid].float())
+    q_d = q_d / (q_d.norm() + 1e-8)
+
+    # 整个 CSR @ q -> 全池 sims [N] (稠密), 再普通索引取子集
+    all_sims = (csr_mat @ q_d.unsqueeze(1)).squeeze(1)   # [N] 稠密
+    sims = all_sims[cand_indices]                         # 稠密索引, 一定支持
+    return sims
 
 
 def sparse_sim_with_lookup(q_sparse, lookup, cand_indices, device="cuda"):
@@ -407,9 +606,10 @@ def sparse_sim_with_lookup(q_sparse, lookup, cand_indices, device="cuda"):
     q_d = torch.zeros(V, dtype=torch.float32, device=device)
     q_d.scatter_add_(0, pos_v, acts_v)
     q_d = q_d / (q_d.norm() + 1e-8)
+    q_d = q_d.to(c_dense_norm.dtype)           # 跟 c_dense 同 dtype (可能 fp16)
 
     c_subset = c_dense_norm[cand_indices]      # [N_subset, V] GPU
-    sims = c_subset @ q_d                      # [N_subset] GPU
+    sims = (c_subset @ q_d).float()            # 算完转回 fp32 保证 rank 比较稳
     return sims
 
 
@@ -418,7 +618,7 @@ def sparse_sim_with_lookup(q_sparse, lookup, cand_indices, device="cuda"):
 # ============================================================
 def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
                    q_orig, c_orig_all,
-                   q_sae=None, sparse_lookup=None,
+                   q_sae=None, csr_mat=None, V_total=None,
                    cid2idx=None, device="cuda"):
     K = len(cand_cids)
     min_pool = 20
@@ -449,9 +649,9 @@ def eval_one_query(cand_cids, gold_pos, sample_ratio, rng,
     rank_orig = int((sims_orig > gold_score_orig).sum().item()) + 1
     out = {"orig_rank_sample": rank_orig, "n_sample": n_sample, "K": K}
 
-    # sae 路径 (GPU)
-    if q_sae is not None and sparse_lookup is not None:
-        sims_sae = sparse_sim_with_lookup(q_sae, sparse_lookup, cand_idx_tensor, device)
+    # sae 路径 (GPU, 用预建 CSR 稀疏矩阵复用)
+    if q_sae is not None and csr_mat is not None:
+        sims_sae = sparse_sim_csr(q_sae, csr_mat, V_total, cand_idx_tensor, device)
         gold_score_sae = sims_sae[new_gold_pos]
         rank_sae = int((sims_sae > gold_score_sae).sum().item()) + 1
         out["sae_rank_sample"] = rank_sae
@@ -504,7 +704,7 @@ def main():
     parser.add_argument("--num_queries", type=int, default=200)
     parser.add_argument("--sample_ratio", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=48)
     parser.add_argument("--output_dir", default="outputs/zero_shot")
     parser.add_argument("--ckpt", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -539,12 +739,19 @@ def main():
     print(f"[eval] will run: {datasets_to_run}", flush=True)
 
     print("[eval] loading model + SAE ...", flush=True)
+    gpu_mem("before model load")
     if torch.cuda.is_available():
         orig_dm = cfg.model.device_map
         cfg.model.device_map = {"": 0}
         print(f"[eval] override device_map: {orig_dm} -> {{'': 0}}", flush=True)
 
+
+    if not args.ckpt:
+        cfg.model.lora.enable = False   # 无 ckpt 时不注入 LoRA, 评估纯基座
+
+    cfg.model.lora.enable = False       # 统一关掉，不管有没有 ckpt    
     model, processor = load_model(cfg)
+    gpu_mem("after model load")
     if args.ckpt:
         from model import load_adapter
         model = load_adapter(model, args.ckpt)
@@ -561,6 +768,7 @@ def main():
     else:
         sae = load_sae(cfg, device=device)
         sae_hook = attach_sae_hook(model, sae, cfg) if sae is not None else None
+        gpu_mem("after SAE load")
 
     pool_layer_idx = getattr(cfg.train, "pool_layer_idx", cfg.sae.layer_idx)
     extractor = Extractor(model, sae_hook, pool_layer_idx, device)
@@ -587,23 +795,36 @@ def main():
               f"avg K: {avg_K:.0f}", flush=True)
 
         try:
+            gpu_mem(f"{ds_name} before encode")
             t_fwd = time.time()
             cid_list, c_orig, c_sae = extractor.encode(
                 UnitDataset(cands), args.batch_size, collate,
                 desc="cand", num_workers=args.num_workers)
+            torch.cuda.empty_cache()    # cand encode 后还 reserved, 给 query encode 腾地方
             qid_list, q_orig, q_sae = extractor.encode(
                 UnitDataset(queries), args.batch_size, collate,
                 desc="query", num_workers=args.num_workers)
             print(f"[eval]   forward (encode) took {time.time()-t_fwd:.1f}s", flush=True)
+            torch.cuda.empty_cache()    # encode 占满的 reserved 还给系统, 给 CSR 腾地方
+            gpu_mem(f"{ds_name} after encode (已 empty_cache)")
             cid2idx = {c: i for i, c in enumerate(cid_list)}
 
-            sparse_lookup = None
-            if c_sae and q_sae:
-                print("[eval]   building sparse lookup ...", flush=True)
-                t_lk = time.time()
-                sparse_lookup = build_sparse_lookup(c_sae, device=str(device))
-                print(f"[eval]   sparse lookup built in {time.time()-t_lk:.1f}s",
-                      flush=True)
+            # SAE 路径: 用 torch.sparse 全池建一个 CSR 稀疏矩阵 (只存非零, 省显存),
+            # 所有 query 复用同一个矩阵 (保留 candidate 复用红利)
+            csr_mat, V_total = None, None
+            use_sae = bool(c_sae) and bool(q_sae)
+            if use_sae:
+                # 预测稀疏矩阵显存 (nnz × ~20B 中间峰值)
+                nnz_est = sum(s[1].shape[0] for s in c_sae)
+                estimate_mem(f"sparse CSR (nnz={nnz_est})", nnz_est, bytes_per=20)
+                print("[eval]   building sparse CSR (torch.sparse) ...", flush=True)
+                res = build_sparse_csr(c_sae, device=str(device))
+                if res is None:
+                    print("[eval]   sparse CSR skipped (显存不足), orig only", flush=True)
+                    use_sae = False
+                else:
+                    csr_mat, V_total = res
+                    gpu_mem(f"{ds_name} after build CSR")
 
             print(f"[eval]   computing ranks ...", flush=True)
             rng = random.Random(args.seed)
@@ -616,14 +837,18 @@ def main():
                 r = eval_one_query(
                     cand_cids, qid2gold_pos[qid], args.sample_ratio, rng,
                     q_orig=q_orig[qi], c_orig_all=c_orig,
-                    q_sae=q_sae[qi] if q_sae else None,
-                    sparse_lookup=sparse_lookup,
+                    q_sae=q_sae[qi] if (use_sae and qi < len(q_sae)) else None,
+                    csr_mat=csr_mat if use_sae else None,
+                    V_total=V_total,
                     cid2idx=cid2idx, device=str(device))
                 per_q.append(r)
             print(f"[eval]   ranks computed in {time.time()-t_rank:.1f}s", flush=True)
+            gpu_mem(f"{ds_name} after ranks")
 
-            del sparse_lookup
+            del csr_mat
+            c_orig = c_sae = q_orig = q_sae = None   # 释放该数据集的 emb/激活
             torch.cuda.empty_cache()
+            gpu_mem(f"{ds_name} after cleanup")
 
             metrics = aggregate(per_q)
             for key, m in metrics.items():
@@ -657,7 +882,7 @@ def main():
 
 def plot_results(results, out_path):
     import matplotlib.pyplot as plt
-    datasets = list(results.keys())
+    datasets = sorted(results.keys())
     if not datasets: return
     metric_keys = [("top1", "Top-1"), ("top5", "Top-5"), ("top10", "Top-10"),
                    ("mrr", "MRR"), ("acc", "Acc (beat ratio)")]

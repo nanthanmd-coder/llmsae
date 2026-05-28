@@ -549,8 +549,10 @@ class Trainer:
                     self.writer.add_scalar(k, v, self.global_step)
                 self.writer.add_scalar("lr", lr, self.global_step)
 
-        # 评估 + 保存最优
-        if self.global_step % cfg.train.eval_steps == 0 and self.eval_dataset is not None:
+        # 评估 + 保存最优 (eval_steps <= 0 表示禁用训练中评估)
+        if (cfg.train.eval_steps > 0
+                and self.global_step % cfg.train.eval_steps == 0
+                and self.eval_dataset is not None):
             self._print(f"[step {self.global_step}] running evaluation...")
             metric = self.evaluate()
             if self.is_main:
@@ -580,9 +582,12 @@ class Trainer:
     @torch.no_grad()
     def evaluate(self, dataset=None):
         dataset = dataset or self.eval_dataset
+        # eval 用很少的 worker: 数据量小不是瓶颈, 且多次 eval (step 100/200/...) 累积
+        # worker 线程会导致 "can't start new thread"。DDP 下还会 ×进程数, 更要省。
+        eval_workers = min(2, self.cfg.data.num_workers)
         loader = DataLoader(
             dataset, batch_size=self.cfg.eval.batch_size, shuffle=False,
-            num_workers=self.cfg.data.num_workers, collate_fn=self.collate_fn,
+            num_workers=eval_workers, collate_fn=self.collate_fn,
         )
         if self.accelerator is not None:
             loader = self.accelerator.prepare(loader)
@@ -609,6 +614,17 @@ class Trainer:
 
         acc = (total_acc / n.clamp_min(1)).item()
         self._print(f"[eval] done, top1_acc={acc:.4f}")
+
+        # 显式释放 eval loader 的 worker 进程, 防多次 eval 累积线程 -> can't start new thread
+        try:
+            if hasattr(loader, "_iterator") and loader._iterator is not None:
+                loader._iterator._shutdown_workers()
+            del loader
+            import gc; gc.collect()
+        except Exception:
+            pass
+
+        self.model.train()   # eval 后切回 train 模式
         return acc
 
     def save(self, tag="adapter"):

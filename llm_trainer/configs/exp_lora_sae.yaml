@@ -15,7 +15,7 @@ data:
   data_root: ../MMEB-eval
   images_root: ../MMEB-eval/images
   # 示例: 只用这两个数据集训练; 改成 null 用全部
-  train_datasets: ["ChartQA", "MSCOCO"]
+  train_datasets: ["CIRR", "FashionIQ", "Visual7W", "A-OKVQA", "GQA", "OK-VQA", "TextVQA", "WebQA", "Wiki-SS-NQ"]
   eval_datasets: ["ChartQA"]
   max_candidates: 16
   max_length: 512
@@ -24,6 +24,8 @@ train:
   epochs: 2
   batch_size: 1
   grad_accum_steps: 16
-  lr: 1.0e-4
+  lr: 5.0e-5
   pool_layer_idx: 24
   info_nce_temp: 0.07
+  save_steps: 50      # 每 50 step 存一次
+  eval_steps: -1      # -1 = 训练中不评估 (省时间/避免 eval 线程问题)。
